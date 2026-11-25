@@ -134,6 +134,11 @@
   <h1>聚合口摘链演练</h1>
   <span class="sub">两条 FIFO 链路 · 送达/确认延时可变 · 摘链一次一个</span>
   <span class="grow"></span>
+  <span id="clock" class="pill">时钟读取中…</span>
+  <span id="ff-box" class="row" style="display:none; align-items:center; gap:6px;">
+    <input id="ff-ms" type="number" min="0" value="1000" style="width:110px;" title="快进毫秒数">
+    <button id="btn-advance" class="primary">快进</button>
+  </span>
   <span id="health" class="pill">连接中…</span>
   <button id="btn-reset" class="danger">重置演练</button>
 </header>
@@ -276,6 +281,7 @@ async function refresh() {
     const state = await api("GET", "/api/state");
     $("health").className = "pill ok";
     $("health").textContent = "运行中";
+    renderClock(state.clock);
     renderLinks(state.links);
     renderFlows(state.flows);
     if (state.active_removal) renderActiveRemoval(state.active_removal);
@@ -283,6 +289,22 @@ async function refresh() {
     $("health").className = "pill err";
     $("health").textContent = "服务不可用";
   }
+}
+
+let lastClockMode = null;
+function renderClock(clock) {
+  if (!clock) return;
+  const el = $("clock");
+  if (clock.clock_mode === "virtual") {
+    el.className = "pill warn";
+    el.textContent = `虚拟时钟（仅快进时走）· t=${clock.sim_time_ms}ms`;
+    $("ff-box").style.display = "flex";
+  } else {
+    el.className = "pill ok";
+    el.textContent = `实时时钟 · t=${clock.sim_time_ms}ms`;
+    $("ff-box").style.display = "none";
+  }
+  lastClockMode = clock.clock_mode;
 }
 
 function renderLinks(links) {
@@ -560,10 +582,22 @@ function bind() {
   $("btn-reset").addEventListener("click", async () => {
     try {
       await api("POST", "/api/reset");
-      logLine("演练已重置", "ok");
+      logLine("演练已重置，模拟时钟归零", "ok");
       refresh(); refreshRemovals();
     } catch (err) { logLine(err.message, "err"); }
   });
+
+  const advanceBtn = $("btn-advance");
+  if (advanceBtn) {
+    advanceBtn.addEventListener("click", async () => {
+      const ms = Number($("ff-ms").value) || 0;
+      try {
+        const r = await api("POST", "/api/clock/advance", { ms });
+        logLine(`快进 ${ms}ms -> t=${r.sim_time_ms}ms，处理事件 ${r.events_processed} 个`, "ok");
+        refresh(); refreshRemovals(); refreshReceived();
+      } catch (err) { logLine(`快进失败: ${err.message}`, "err"); }
+    });
+  }
 }
 
 bind();

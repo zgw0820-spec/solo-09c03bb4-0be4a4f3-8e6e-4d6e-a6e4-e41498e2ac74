@@ -17,6 +17,17 @@ def make_client(a_delivery=60, a_ack=30, b_delivery=30, b_ack=15) -> TestClient:
     return TestClient(create_app(config))
 
 
+def make_virtual_client(
+    a_delivery=300, a_ack=200, b_delivery=150, b_ack=80
+) -> TestClient:
+    config = EngineConfig(
+        link_a=LinkConfig("A", a_delivery, a_ack),
+        link_b=LinkConfig("B", b_delivery, b_ack),
+        clock_mode="virtual",
+    )
+    return TestClient(create_app(config))
+
+
 def wait_for(client: TestClient, predicate, timeout_s: float = 8.0, interval_s: float = 0.02):
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -321,3 +332,251 @@ def test_static_ui_is_served(client):
     assert response.status_code == 200
     assert "聚合口摘链演练" in response.text
     assert "https://" not in response.text  # no external assets needed offline
+
+
+# ---------------------------------------------------------------- virtual clock
+
+
+@pytest.fixture()
+def virtual_client():
+    with make_virtual_client() as test_client:
+        yield test_client
+
+
+def advance(client: TestClient, ms: int) -> dict:
+    response = client.post("/api/clock/advance", json={"ms": ms})
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_virtual_clock_only_moves_on_advance(virtual_client):
+    client = virtual_client
+    clock = client.get("/api/clock").json()
+    assert clock["clock_mode"] == "virtual"
+    assert clock["sim_time_ms"] == 0
+
+    create_flow(client, "f", "A")
+
+    # An idle window with nothing queued processes no events at all.
+    idle = advance(client, 120_000)
+    assert idle["events_processed"] == 0
+    assert idle["sim_time_ms"] == 120_000
+
+    # Packets queued after the idle jump still pay only the link delay.
+    send(client, "f", 1)
+    send(client, "f", 2)
+    assert client.get("/api/clock").json()["sim_time_ms"] == 120_000
+    assert received(client, "f") == []
+
+    body = advance(client, 300)
+    assert body["sim_time_ms"] == 120_300
+    order = received(client, "f")
+    assert [item["seq"] for item in order] == [1]
+    assert order[0]["received_at_ms"] == 120_300
+    # The second packet is still waiting behind the first on the FIFO link.
+    assert len(received(client, "f")) == 1
+
+
+def test_virtual_fast_forward_removal_success_and_flush(virtual_client):
+    client = virtual_client
+    create_flow(client, "voice", "A")
+    create_flow(client, "video", "B")
+    send(client, "voice", 1)
+    send(client, "voice", 2)
+
+    rm = client.post(
+        "/api/removals",
+        json={"member_link": "A", "wait_ms": 5000, "buffer_limit": 5},
+    )
+    assert rm.status_code == 202
+    removal_id = rm.json()["removal_id"]
+    assert rm.json()["deadline_ms"] == 5000
+    send(client, "voice", 3, expect=202)
+    send(client, "video", 1)
+
+    # A: pkt1 deliver 300 / ack 500, pkt2 deliver 800 / ack 1000.
+    advance(client, 1000)
+    detail = removal(client, removal_id)
+    assert detail["status"] == "succeeded"
+    assert detail["reason"] == "peer_confirmed"
+    assert detail["finished_at_ms"] == 1000
+    assert detail["moved_flow_ids"] == ["voice"]
+    assert detail["flushed_to"] == "B"
+    assert len(detail["flushed_packet_ids"]) == 1
+
+    # pkt3 flushed at t=1000 onto B: delivery 150 -> received at 1150.
+    advance(client, 150)
+    order = received(client, "voice")
+    assert [item["seq"] for item in order] == [1, 2, 3]
+    assert [item["link"] for item in order] == ["A", "A", "B"]
+    assert [item["received_at_ms"] for item in order] == [300, 800, 1150]
+
+
+def test_virtual_confirmation_on_exact_deadline_times_out_and_is_late(virtual_client):
+    client = virtual_client
+    create_flow(client, "f-a", "A")
+    send(client, "f-a", 1)  # delivered 300, acked exactly at 500
+
+    rm = client.post(
+        "/api/removals",
+        json={"member_link": "A", "wait_ms": 500, "buffer_limit": 4},
+    )
+    removal_id = rm.json()["removal_id"]
+    send(client, "f-a", 2, expect=202)
+    send(client, "f-a", 3, expect=202)
+
+    body = advance(client, 500)
+    assert body["sim_time_ms"] == 500
+    detail = removal(client, removal_id)
+    assert detail["status"] == "timed_out"
+    assert detail["reason"] == "wait_timeout"
+    assert detail["moved_flow_ids"] == []
+    assert detail["flushed_to"] == "A"
+    # Timeout (priority 0) beats the same-instant ACK, which is then recorded
+    # as a late confirmation instead of completing the removal.
+    assert detail["late_confirmations_ignored"] == 1
+    assert detail["snapshot_acked"] == 0
+    assert client.get("/api/flows/f-a").json()["link"] == "A"
+
+    # Buffered packets went back to A at t=500. FIFO: pkt2 delivered at 800,
+    # then its ack at 1000 frees the link, so pkt3 is delivered at 1300.
+    advance(client, 600)
+    order = received(client, "f-a")
+    assert [item["seq"] for item in order] == [1, 2]
+    assert all(item["link"] == "A" for item in order)
+    advance(client, 300)
+    order = received(client, "f-a")
+    assert [item["seq"] for item in order] == [1, 2, 3]
+    assert [item["received_at_ms"] for item in order] == [300, 800, 1300]
+    # The late confirmation never changes the final result.
+    assert removal(client, removal_id)["status"] == "timed_out"
+
+
+def test_virtual_split_advance_matches_one_shot_advance(virtual_client):
+    client = virtual_client
+
+    def run(advances):
+        client.post("/api/reset")
+        client.patch("/api/links/A", json={"delivery_delay_ms": 300, "ack_delay_ms": 200})
+        client.patch("/api/links/B", json={"delivery_delay_ms": 150, "ack_delay_ms": 80})
+        create_flow(client, "eq", "A")
+        send(client, "eq", 1)
+        send(client, "eq", 2)
+        rid = client.post(
+            "/api/removals",
+            json={"member_link": "A", "wait_ms": 1200, "buffer_limit": 5},
+        ).json()["removal_id"]
+        send(client, "eq", 3, expect=202)
+        for ms in advances:
+            advance(client, ms)
+
+        detail = removal(client, rid)
+        order = received(client, "eq")
+        return {
+            "status": detail["status"],
+            "reason": detail["reason"],
+            "finished_at_ms": detail["finished_at_ms"],
+            "flushed_to": detail["flushed_to"],
+            "late": detail["late_confirmations_ignored"],
+            "received": [
+                (item["seq"], item["link"], item["received_at_ms"]) for item in order
+            ],
+            "clock": client.get("/api/clock").json()["sim_time_ms"],
+        }
+
+    segmented = run([250, 250, 250, 250])
+    one_shot = run([1000])
+    assert segmented == one_shot
+    assert segmented["status"] == "succeeded"
+    assert segmented["received"] == [(1, "A", 300), (2, "A", 800)]
+    # pkt3 is flushed at t=1000 onto B once the snapshot is confirmed; it
+    # needs another advance beyond the 1000ms window to be delivered.
+    assert segmented["clock"] == 1000
+
+
+def test_virtual_split_advance_matches_one_shot_on_exact_timeout(virtual_client):
+    """The deadline-tie rule must be identical no matter how time is split."""
+    client = virtual_client
+
+    def run(advances):
+        client.post("/api/reset")
+        client.patch("/api/links/A", json={"delivery_delay_ms": 300, "ack_delay_ms": 200})
+        create_flow(client, "tm", "A")
+        send(client, "tm", 1)  # acked exactly at 500
+        rid = client.post(
+            "/api/removals",
+            json={"member_link": "A", "wait_ms": 500, "buffer_limit": 5},
+        ).json()["removal_id"]
+        send(client, "tm", 2, expect=202)
+        for ms in advances:
+            advance(client, ms)
+        detail = removal(client, rid)
+        return {
+            "status": detail["status"],
+            "reason": detail["reason"],
+            "late": detail["late_confirmations_ignored"],
+            "flushed_to": detail["flushed_to"],
+            "finished_at_ms": detail["finished_at_ms"],
+        }
+
+    segmented = run([100, 200, 200])
+    one_shot = run([500])
+    assert segmented == one_shot
+    assert segmented == {
+        "status": "timed_out",
+        "reason": "wait_timeout",
+        "late": 1,
+        "flushed_to": "A",
+        "finished_at_ms": 500,
+    }
+
+
+def test_virtual_reset_returns_clock_to_zero(virtual_client):
+    client = virtual_client
+    create_flow(client, "f", "A")
+    send(client, "f", 1)
+    advance(client, 400)
+    assert client.get("/api/clock").json()["sim_time_ms"] == 400
+
+    body = client.post("/api/reset").json()
+    assert body["clock"]["sim_time_ms"] == 0
+    assert body["clock"]["clock_mode"] == "virtual"
+    assert client.get("/api/clock").json()["sim_time_ms"] == 0
+    assert client.get("/api/flows").json()["flows"] == []
+    assert client.get("/api/removals").json()["removals"] == []
+    state = client.get("/api/state").json()
+    assert state["clock"]["sim_time_ms"] == 0
+    assert all(link["queue_depth"] == 0 for link in state["links"])
+
+
+def test_virtual_buffer_limit_rejects(virtual_client):
+    client = virtual_client
+    create_flow(client, "f-a", "A")
+    send(client, "f-a", 1)
+    client.post(
+        "/api/removals",
+        json={"member_link": "A", "wait_ms": 5000, "buffer_limit": 1},
+    )
+    send(client, "f-a", 2, expect=202)
+    rejected = client.post("/api/flows/f-a/packets", json={"seq": 3})
+    assert rejected.status_code == 429
+    assert rejected.json()["buffer_limit"] == 1
+
+
+def test_realtime_mode_rejects_advance_and_exposes_clock(client):
+    clock = client.get("/api/clock").json()
+    assert clock["clock_mode"] == "realtime"
+    assert clock["advancing"] is False
+    denied = client.post("/api/clock/advance", json={"ms": 100})
+    assert denied.status_code == 409
+    assert denied.json()["clock_mode"] == "realtime"
+
+
+def test_virtual_advance_validates_payload(virtual_client):
+    client = virtual_client
+    assert client.post("/api/clock/advance", json={"ms": -1}).status_code == 422
+    over = client.post("/api/clock/advance", json={"ms": 3_600_001})
+    assert over.status_code == 422
+    zero = client.post("/api/clock/advance", json={"ms": 0})
+    assert zero.status_code == 200
+    assert zero.json()["sim_time_ms"] == 0

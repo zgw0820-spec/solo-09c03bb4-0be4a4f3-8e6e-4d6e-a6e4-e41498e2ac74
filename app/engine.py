@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
+import itertools
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable
 
 LINK_IDS = ("A", "B")
+CLOCK_MODES = ("realtime", "virtual")
+
+# Virtual clock renders its monotonic milliseconds as ISO timestamps starting
+# from a fixed epoch, so drill output still shows recognizable UTC strings.
+VIRTUAL_EPOCH = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+MAX_ADVANCE_MS = 3_600_000  # one simulated hour per fast-forward call
 
 
 def utcnow() -> str:
@@ -32,7 +40,7 @@ class LinkState:
     id: str
     delivery_delay_ms: int
     ack_delay_ms: int
-    queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    queue: list["Packet"] = field(default_factory=list)
     worker: asyncio.Task | None = None
     enqueued: int = 0
     delivered: int = 0
@@ -40,18 +48,23 @@ class LinkState:
     current_packet_id: str | None = None
     current_phase: str = "idle"
     removed: bool = False
+    # Simulated time (ms) at which the in-flight packet finishes each phase.
+    delivery_due_ms: int | None = None
+    ack_due_ms: int | None = None
 
     def to_dict(self) -> dict:
         return {
             "id": self.id,
             "delivery_delay_ms": self.delivery_delay_ms,
             "ack_delay_ms": self.ack_delay_ms,
-            "queue_depth": self.queue.qsize(),
+            "queue_depth": len(self.queue),
             "enqueued": self.enqueued,
             "delivered": self.delivered,
             "acked": self.acked,
             "current_packet_id": self.current_packet_id,
             "current_phase": self.current_phase,
+            "delivery_due_ms": self.delivery_due_ms,
+            "ack_due_ms": self.ack_due_ms,
             "removed": self.removed,
         }
 
@@ -61,6 +74,7 @@ class Flow:
     id: str
     link: str
     created_at: str
+    created_at_ms: int
     accepted_count: int = 0
     seen_seqs: set[int] = field(default_factory=set)
     received: list[dict] = field(default_factory=list)
@@ -70,6 +84,7 @@ class Flow:
             "id": self.id,
             "link": self.link,
             "created_at": self.created_at,
+            "created_at_ms": self.created_at_ms,
             "accepted_count": self.accepted_count,
             "received_count": len(self.received),
         }
@@ -83,10 +98,13 @@ class Packet:
     payload: Any
     accepted_at: str
     accept_index: int
+    accepted_at_ms: int
     status: str = "queued"  # queued | delivering | delivered | acked | buffered
     link: str | None = None
     delivered_at: str | None = None
+    delivered_at_ms: int | None = None
     acked_at: str | None = None
+    acked_at_ms: int | None = None
     flow_delivery_index: int | None = None
     buffered_for_removal: str | None = None
 
@@ -98,8 +116,11 @@ class Packet:
             "status": self.status,
             "link": self.link,
             "accepted_at": self.accepted_at,
+            "accepted_at_ms": self.accepted_at_ms,
             "delivered_at": self.delivered_at,
+            "delivered_at_ms": self.delivered_at_ms,
             "acked_at": self.acked_at,
+            "acked_at_ms": self.acked_at_ms,
             "flow_delivery_index": self.flow_delivery_index,
             "buffered_for_removal": self.buffered_for_removal,
             "payload": self.payload,
@@ -114,8 +135,11 @@ class RemovalRequest:
     wait_ms: int
     buffer_limit: int
     created_at: str
+    created_at_ms: int
+    deadline_ms: int
     status: str = "pending"  # pending | succeeded | timed_out
     finished_at: str | None = None
+    finished_at_ms: int | None = None
     result: str | None = None
     reason: str | None = None
     affected_flow_ids: list[str] = field(default_factory=list)
@@ -130,10 +154,13 @@ class RemovalRequest:
     late_confirmation_packet_ids: list[str] = field(default_factory=list)
     moved_flow_ids: list[str] = field(default_factory=list)
     timeout_task: asyncio.Task | None = field(default=None, repr=False)
+    timeout_seq: int | None = field(default=None, repr=False)
     events: list[dict] = field(default_factory=list)
 
-    def add_event(self, event_type: str, **detail: Any) -> None:
-        self.events.append({"at": utcnow(), "type": event_type, **detail})
+    def add_event(self, engine: "DrillEngine", event_type: str, **detail: Any) -> None:
+        self.events.append(
+            {"at": engine.now_iso, "at_ms": engine.now_ms, "type": event_type, **detail}
+        )
 
     def to_dict(self) -> dict:
         return {
@@ -147,7 +174,10 @@ class RemovalRequest:
             "buffer_limit": self.buffer_limit,
             "buffer_used": len(self.buffered_packet_ids),
             "created_at": self.created_at,
+            "created_at_ms": self.created_at_ms,
+            "deadline_ms": self.deadline_ms,
             "finished_at": self.finished_at,
+            "finished_at_ms": self.finished_at_ms,
             "affected_flow_ids": self.affected_flow_ids,
             "moved_flow_ids": self.moved_flow_ids,
             "snapshot_packet_ids": self.snapshot_packet_ids,
@@ -178,6 +208,16 @@ class DrillEngine:
     processes one packet at a time. The peer's "catch-up confirmation" for a
     removal is derived from the ACK of every packet that was already queued on
     the member link when the removal request was created.
+
+    Two clock modes share one implementation:
+
+    * ``realtime`` (default): phases are driven by asyncio tasks sleeping for
+      the configured delays, exactly like a wall-clock simulation.
+    * ``virtual``: nothing happens on its own. The clock only advances through
+      :meth:`advance_clock`, which runs every delivery/ack/timeout event whose
+      scheduled time is within the target simulated time. Events at the same
+      simulated time are processed in a fixed deterministic order, so splitting
+      an advance into pieces never changes the outcome.
     """
 
     def __init__(
@@ -186,7 +226,11 @@ class DrillEngine:
         link_a_ack_ms: int = 200,
         link_b_delivery_ms: int = 150,
         link_b_ack_ms: int = 80,
+        clock_mode: str = "realtime",
     ):
+        if clock_mode not in CLOCK_MODES:
+            raise ValueError(f"clock_mode must be one of {CLOCK_MODES}, got {clock_mode!r}")
+        self.clock_mode = clock_mode
         self._lock = asyncio.Lock()
         self._defaults = {
             "A": (link_a_delivery_ms, link_a_ack_ms),
@@ -199,7 +243,94 @@ class DrillEngine:
         self.active_removal_id: str | None = None
         self._packets: dict[str, Packet] = {}
         self.events: list[dict] = []
+
+        # Virtual-clock event heap (heapq entries are lists so a cancelled
+        # event can be neutralised in place without breaking heap order):
+        # [time_ms, priority, seq, callback].
+        # Priority makes same-time ordering deterministic:
+        #   0 removal timeout (a confirmation landing on the deadline is late)
+        #   1 packet delivery / acknowledgement (ties broken by scheduling seq)
+        self._event_heap: list[list[Any]] = []
+        self._event_seq = itertools.count()
+        self._realtime_tasks: set[asyncio.Task] = set()
+        self._now_ms: int = 0
+        self._realtime_origin = self._wall_monotonic_ms()
         self._reset_state()
+
+    # ------------------------------------------------------------------ clock
+    @staticmethod
+    def _wall_monotonic_ms() -> float:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        return loop.time() * 1000
+
+    @property
+    def now_ms(self) -> int:
+        if self.clock_mode == "virtual":
+            return self._now_ms
+        return int(self._wall_monotonic_ms() - self._realtime_origin)
+
+    @property
+    def now_iso(self) -> str:
+        if self.clock_mode == "virtual":
+            return (
+                (VIRTUAL_EPOCH + timedelta(milliseconds=self._now_ms))
+                .isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z")
+            )
+        return utcnow()
+
+    def clock_view(self) -> dict:
+        return {
+            "clock_mode": self.clock_mode,
+            "sim_time_ms": self.now_ms,
+            "sim_time": self.now_iso,
+            "advancing": self.clock_mode == "virtual",
+            "scheduled_events": len(self._event_heap),
+        }
+
+    def _schedule(
+        self,
+        delay_ms: int,
+        callback: Callable[[], None],
+        priority: int = 1,
+        name: str | None = None,
+    ) -> tuple[int, int, asyncio.Task | None]:
+        """Run ``callback`` after ``delay_ms`` simulated milliseconds.
+
+        Returns (scheduled time, heap sequence, realtime task). In realtime
+        mode the callback runs inside an asyncio task that re-takes the engine
+        lock; in virtual mode it is popped from the heap during
+        :meth:`advance_clock`.
+        """
+        due_ms = self.now_ms + max(0, int(delay_ms))
+        if self.clock_mode == "virtual":
+            seq = next(self._event_seq)
+            heapq.heappush(
+                self._event_heap, [due_ms, priority, seq, callback]
+            )
+            return due_ms, seq, None
+
+        async def _runner() -> None:
+            await asyncio.sleep(max(0, int(delay_ms)) / 1000)
+            async with self._lock:
+                callback()
+
+        task = asyncio.create_task(_runner(), name=name or "scheduled")
+        self._realtime_tasks.add(task)
+        task.add_done_callback(self._realtime_tasks.discard)
+        return due_ms, -1, task
+
+    def _cancel_scheduled(self, due_ms: int | None, seq: int | None) -> None:
+        if self.clock_mode != "virtual" or seq is None:
+            return
+        for entry in self._event_heap:
+            if entry[2] == seq and entry[0] == due_ms:
+                entry[3] = lambda: None  # neutralise; heap entry stays ordered
+                return
 
     # ------------------------------------------------------------------ setup
     def _reset_state(self) -> None:
@@ -212,13 +343,20 @@ class DrillEngine:
         self.active_removal_id = None
         self._packets = {}
         self.events = []
+        self._event_heap = []
+        self._event_seq = itertools.count()
+        self._realtime_origin = self._wall_monotonic_ms()
+        self._now_ms = 0
 
     async def start(self) -> None:
+        if self.clock_mode != "realtime":
+            return
         for link in self.links.values():
             if link.worker is None or link.worker.done():
                 link.worker = asyncio.create_task(
                     self._link_worker(link), name=f"link-{link.id}"
                 )
+                self._realtime_tasks.add(link.worker)
 
     async def stop(self) -> None:
         tasks: list[asyncio.Task] = []
@@ -227,63 +365,157 @@ class DrillEngine:
                 link.worker.cancel()
                 tasks.append(link.worker)
                 link.worker = None
-        for removal in self.removals.values():
-            if removal.timeout_task is not None:
-                removal.timeout_task.cancel()
-                tasks.append(removal.timeout_task)
-                removal.timeout_task = None
+        for task in list(self._realtime_tasks):
+            task.cancel()
+            tasks.append(task)
         for task in tasks:
             try:
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
+        self._realtime_tasks.clear()
 
     def _log(self, event_type: str, **detail: Any) -> None:
-        self.events.append({"at": utcnow(), "type": event_type, **detail})
+        self.events.append(
+            {"at": self.now_iso, "at_ms": self.now_ms, "type": event_type, **detail}
+        )
         if len(self.events) > 2000:
             del self.events[: len(self.events) - 2000]
 
+    # ------------------------------------------------------------- fast forward
+    async def advance_clock(self, ms: int) -> dict:
+        if self.clock_mode != "virtual":
+            raise DrillError(
+                409,
+                "clock fast-forward is only available when the drill starts in "
+                "virtual clock mode (DRILL_CLOCK_MODE=virtual)",
+                {"clock_mode": self.clock_mode},
+            )
+        if ms < 0:
+            raise DrillError(400, "ms must be >= 0")
+        if ms > MAX_ADVANCE_MS:
+            raise DrillError(
+                400,
+                f"ms must be <= {MAX_ADVANCE_MS} per advance",
+                {"max_ms": MAX_ADVANCE_MS},
+            )
+        processed = 0
+        target_ms = self._now_ms + ms
+        while self._event_heap and self._event_heap[0][0] <= target_ms:
+            due_ms, _priority, _seq, callback = heapq.heappop(self._event_heap)
+            # The clock only moves when explicitly advanced; idle time with no
+            # events costs nothing, and every callback sees the event's time.
+            self._now_ms = due_ms
+            callback()
+            processed += 1
+        self._now_ms = target_ms
+        return {
+            "advanced_ms": ms,
+            "sim_time_ms": self._now_ms,
+            "sim_time": self.now_iso,
+            "events_processed": processed,
+            "scheduled_events": len(self._event_heap),
+            "target_ms": target_ms,
+        }
+
     # ------------------------------------------------------------------ links
     async def _link_worker(self, link: LinkState) -> None:
+        """Realtime FIFO worker; only used in realtime clock mode."""
         while True:
-            packet = await link.queue.get()
+            packet = await self._wait_for_packet(link)
             async with self._lock:
                 link.current_packet_id = packet.id
                 link.current_phase = "delivering"
                 packet.status = "delivering"
                 delivery_delay = link.delivery_delay_ms
+                link.delivery_due_ms = self.now_ms + delivery_delay
             await asyncio.sleep(delivery_delay / 1000)
 
             async with self._lock:
-                flow = self.flows.get(packet.flow_id)
-                if flow is None:
-                    link.current_packet_id = None
-                    link.current_phase = "idle"
+                if not self._deliver_packet(link, packet):
                     continue
-                packet.status = "delivered"
-                packet.delivered_at = utcnow()
-                flow.received.append(
-                    {
-                        "delivery_index": len(flow.received) + 1,
-                        "packet_id": packet.id,
-                        "seq": packet.seq,
-                        "link": packet.link,
-                        "received_at": packet.delivered_at,
-                    }
-                )
-                packet.flow_delivery_index = len(flow.received)
-                link.delivered += 1
-                link.current_phase = "awaiting_ack"
                 ack_delay = link.ack_delay_ms
+                link.ack_due_ms = self.now_ms + ack_delay
             await asyncio.sleep(ack_delay / 1000)
 
             async with self._lock:
-                packet.status = "acked"
-                packet.acked_at = utcnow()
-                link.acked += 1
-                link.current_packet_id = None
-                link.current_phase = "idle"
-                self._on_packet_acked(packet)
+                self._ack_packet(link, packet)
+
+    async def _wait_for_packet(self, link: LinkState) -> "Packet":
+        # LinkState.queue is a plain list so the virtual engine can share it;
+        # the realtime worker polls it briefly instead of awaiting an
+        # asyncio.Queue.
+        while True:
+            if link.queue:
+                return link.queue.pop(0)
+            await asyncio.sleep(0.005)
+
+    def _pump_link(self, link: LinkState) -> None:
+        """Schedule the next FIFO phase on an idle link (virtual clock)."""
+        if link.removed or link.current_packet_id is not None or not link.queue:
+            return
+        packet = link.queue.pop(0)
+        link.current_packet_id = packet.id
+        link.current_phase = "delivering"
+        packet.status = "delivering"
+        delivery_delay = link.delivery_delay_ms
+        link.delivery_due_ms = self.now_ms + delivery_delay
+        self._schedule(
+            delivery_delay,
+            lambda l=link, p=packet: self._on_delivery_due(l, p),
+        )
+
+    def _on_delivery_due(self, link: LinkState, packet: "Packet") -> None:
+        if not self._deliver_packet(link, packet):
+            return
+        ack_delay = link.ack_delay_ms
+        link.ack_due_ms = self.now_ms + ack_delay
+        self._schedule(
+            ack_delay,
+            lambda l=link, p=packet: self._ack_packet(l, p),
+        )
+
+    def _deliver_packet(self, link: LinkState, packet: "Packet") -> bool:
+        """Mark a packet delivered. Returns False if the flow vanished."""
+        flow = self.flows.get(packet.flow_id)
+        if flow is None:
+            link.current_packet_id = None
+            link.current_phase = "idle"
+            link.delivery_due_ms = None
+            link.ack_due_ms = None
+            if self.clock_mode == "virtual":
+                self._pump_link(link)
+            return False
+        packet.status = "delivered"
+        packet.delivered_at = self.now_iso
+        packet.delivered_at_ms = self.now_ms
+        flow.received.append(
+            {
+                "delivery_index": len(flow.received) + 1,
+                "packet_id": packet.id,
+                "seq": packet.seq,
+                "link": packet.link,
+                "received_at": packet.delivered_at,
+                "received_at_ms": packet.delivered_at_ms,
+            }
+        )
+        packet.flow_delivery_index = len(flow.received)
+        link.delivered += 1
+        link.current_phase = "awaiting_ack"
+        return True
+
+    def _ack_packet(self, link: LinkState, packet: "Packet") -> None:
+        packet.status = "acked"
+        packet.acked_at = self.now_iso
+        packet.acked_at_ms = self.now_ms
+        link.acked += 1
+        link.current_packet_id = None
+        link.current_phase = "idle"
+        link.delivery_due_ms = None
+        link.ack_due_ms = None
+        self._on_packet_acked(packet)
+        if self.clock_mode == "virtual":
+            self._pump_link(link)
 
     async def update_link(
         self,
@@ -330,7 +562,12 @@ class DrillEngine:
                 raise DrillError(409, f"flow {fid!r} already exists")
             if not isinstance(fid, str) or not fid.strip():
                 raise DrillError(400, "flow_id must be a non-empty string")
-            flow = Flow(id=fid, link=link, created_at=utcnow())
+            flow = Flow(
+                id=fid,
+                link=link,
+                created_at=self.now_iso,
+                created_at_ms=self.now_ms,
+            )
             self.flows[fid] = flow
             self._log("flow_created", flow_id=fid, link=link)
             return flow.to_dict()
@@ -366,7 +603,8 @@ class DrillEngine:
                 flow_id=flow_id,
                 seq=seq,
                 payload=payload,
-                accepted_at=utcnow(),
+                accepted_at=self.now_iso,
+                accepted_at_ms=self.now_ms,
                 accept_index=flow.accepted_count + 1,
             )
 
@@ -375,6 +613,7 @@ class DrillEngine:
                 if len(active.buffered_packet_ids) >= active.buffer_limit:
                     active.rejected_count += 1
                     active.add_event(
+                        self,
                         "packet_rejected",
                         flow_id=flow_id,
                         seq=seq,
@@ -400,6 +639,7 @@ class DrillEngine:
                     active.buffered_counts.get(flow_id, 0) + 1
                 )
                 active.add_event(
+                    self,
                     "packet_buffered",
                     packet_id=packet.id,
                     flow_id=flow_id,
@@ -435,16 +675,19 @@ class DrillEngine:
         packet.link = link_id
         packet.status = "queued"
         link.enqueued += 1
-        link.queue.put_nowait(packet)
+        link.queue.append(packet)
+        if self.clock_mode == "virtual":
+            self._pump_link(link)
 
     # ------------------------------------------------------------ peer / views
     async def received_for_flow(self, flow_id: str) -> dict:
         async with self._lock:
             flow = self._get_flow(flow_id)
             return {
-                "flow_id": flow_id,
+                "flow_id": flow.id,
                 "link": flow.link,
                 "created_at": flow.created_at,
+                "created_at_ms": flow.created_at_ms,
                 "accepted_count": flow.accepted_count,
                 "delivery_order": list(flow.received),
                 "count": len(flow.received),
@@ -502,7 +745,9 @@ class DrillEngine:
                 target_link=target_link,
                 wait_ms=wait_ms,
                 buffer_limit=buffer_limit,
-                created_at=utcnow(),
+                created_at=self.now_iso,
+                created_at_ms=self.now_ms,
+                deadline_ms=self.now_ms + wait_ms,
             )
             affected = [f for f in self.flows.values() if f.link == member_link]
             removal.affected_flow_ids = [f.id for f in affected]
@@ -522,6 +767,7 @@ class DrillEngine:
             self._removal_order.append(removal.id)
             self.active_removal_id = removal.id
             removal.add_event(
+                self,
                 "removal_created",
                 member_link=member_link,
                 target_link=target_link,
@@ -540,9 +786,20 @@ class DrillEngine:
             if all(self._packet_acked(pid) for pid in removal.snapshot_packet_ids):
                 self._finish_removal(removal, "succeeded", "peer_confirmed")
             else:
-                removal.timeout_task = asyncio.create_task(
-                    self._removal_timeout(removal.id), name=f"timeout-{removal.id}"
+                # Priority 0: if the last confirmation lands exactly on the
+                # deadline, the timeout is processed first and that confirmation
+                # is recorded as late.
+                due_ms, seq, task = self._schedule(
+                    wait_ms,
+                    lambda rid=removal.id: self._removal_timeout(rid),
+                    priority=0,
+                    name=f"timeout-{removal.id}",
                 )
+                removal.deadline_ms = due_ms
+                if self.clock_mode == "virtual":
+                    removal.timeout_seq = seq
+                else:
+                    removal.timeout_task = task
             return removal.to_dict()
 
     def _packet_acked(self, packet_id: str) -> bool:
@@ -561,19 +818,18 @@ class DrillEngine:
                 removal.late_confirmations_ignored += 1
                 removal.late_confirmation_packet_ids.append(packet.id)
                 removal.add_event(
+                    self,
                     "late_confirmation_ignored",
                     packet_id=packet.id,
                     flow_id=packet.flow_id,
                     seq=packet.seq,
                 )
 
-    async def _removal_timeout(self, removal_id: str) -> None:
-        removal = self.removals[removal_id]
-        await asyncio.sleep(removal.wait_ms / 1000)
-        async with self._lock:
-            if removal.status != "pending":
-                return
-            self._finish_removal(removal, "timed_out", "wait_timeout")
+    def _removal_timeout(self, removal_id: str) -> None:
+        removal = self.removals.get(removal_id)
+        if removal is None or removal.status != "pending":
+            return
+        self._finish_removal(removal, "timed_out", "wait_timeout")
 
     def _finish_removal(
         self, removal: RemovalRequest, status: str, reason: str
@@ -584,15 +840,18 @@ class DrillEngine:
         removal.status = status
         removal.result = status
         removal.reason = reason
-        removal.finished_at = utcnow()
-        timeout_task = removal.timeout_task
-        if (
-            timeout_task is not None
-            and timeout_task is not asyncio.current_task()
-            and not timeout_task.done()
+        removal.finished_at = self.now_iso
+        removal.finished_at_ms = self.now_ms
+        if self.clock_mode == "virtual":
+            self._cancel_scheduled(removal.deadline_ms, removal.timeout_seq)
+        elif (
+            removal.timeout_task is not None
+            and removal.timeout_task is not asyncio.current_task()
+            and not removal.timeout_task.done()
         ):
-            timeout_task.cancel()
+            removal.timeout_task.cancel()
         removal.timeout_task = None
+        removal.timeout_seq = None
         if self.active_removal_id == removal.id:
             self.active_removal_id = None
 
@@ -623,6 +882,7 @@ class DrillEngine:
         removal.buffered_packet_ids = []
         removal.flushed_to = flush_link
         removal.add_event(
+            self,
             "removal_finished",
             status=status,
             reason=reason,
@@ -647,6 +907,7 @@ class DrillEngine:
         async with self._lock:
             active = self._active_removal()
             return {
+                "clock": self.clock_view(),
                 "links": [self.links[lid].to_dict() for lid in LINK_IDS],
                 "flows": [flow.to_dict() for flow in self.flows.values()],
                 "active_removal": active.to_summary() if active else None,
@@ -677,5 +938,6 @@ class DrillEngine:
         async with self._lock:
             return {
                 "reset": True,
+                "clock": self.clock_view(),
                 "links": [self.links[lid].to_dict() for lid in LINK_IDS],
             }

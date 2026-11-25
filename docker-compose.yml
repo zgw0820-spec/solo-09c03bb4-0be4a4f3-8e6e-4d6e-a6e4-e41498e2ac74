@@ -12,6 +12,38 @@ services:
       DRILL_A_ACK_MS: "${DRILL_A_ACK_MS:-200}"
       DRILL_B_DELIVERY_MS: "${DRILL_B_DELIVERY_MS:-150}"
       DRILL_B_ACK_MS: "${DRILL_B_ACK_MS:-80}"
+      # Clock mode:
+      #   realtime (default) - delays elapse on the wall clock
+      #   virtual            - the clock only moves on POST /api/clock/advance
+      #                        (fast-forward drills with no real waiting)
+      DRILL_CLOCK_MODE: "${DRILL_CLOCK_MODE:-realtime}"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  # Fast-forward variant on port 8001, only started on demand:
+  #   docker compose --profile virtual up --build -d drill-virtual
+  drill-virtual:
+    build: .
+    image: aggregation-link-drill:local
+    container_name: aggregation-link-drill-virtual
+    profiles: ["virtual"]
+    ports:
+      - "${DRILL_VIRTUAL_PORT:-8001}:8000"
+    environment:
+      DRILL_A_DELIVERY_MS: "${DRILL_A_DELIVERY_MS:-300}"
+      DRILL_A_ACK_MS: "${DRILL_A_ACK_MS:-200}"
+      DRILL_B_DELIVERY_MS: "${DRILL_B_DELIVERY_MS:-150}"
+      DRILL_B_ACK_MS: "${DRILL_B_ACK_MS:-80}"
+      DRILL_CLOCK_MODE: "virtual"
     healthcheck:
       test:
         - CMD
@@ -33,3 +65,17 @@ services:
       drill:
         condition: service_healthy
     command: ["python", "drills/run_drill.py", "--base-url", "http://drill:8000"]
+
+  # One-shot fast-forward drill against the virtual-clock service:
+  #   docker compose --profile virtual-drill run --rm drill-virtual-client
+  drill-virtual-client:
+    image: aggregation-link-drill:local
+    profiles: ["virtual-drill"]
+    depends_on:
+      drill-virtual:
+        condition: service_healthy
+    command:
+      - "python"
+      - "drills/run_drill_virtual.py"
+      - "--base-url"
+      - "http://drill-virtual:8000"

@@ -53,6 +53,14 @@ class RemovalCreate(BaseModel):
     )
 
 
+class ClockAdvance(BaseModel):
+    ms: int = Field(
+        ge=0,
+        le=3_600_000,
+        description="Virtual milliseconds to advance; the clock only moves on this call",
+    )
+
+
 def _error_response(exc: DrillError) -> JSONResponse:
     body = {"error": exc.message, **exc.context}
     return JSONResponse(status_code=exc.status_code, content=body)
@@ -68,6 +76,7 @@ def create_app(engine_config: EngineConfig | None = None) -> FastAPI:
             link_a_ack_ms=config.link_a.ack_delay_ms,
             link_b_delivery_ms=config.link_b.delivery_delay_ms,
             link_b_ack_ms=config.link_b.ack_delay_ms,
+            clock_mode=config.clock_mode,
         )
         app.state.engine = engine
         await engine.start()
@@ -160,6 +169,14 @@ def create_app(engine_config: EngineConfig | None = None) -> FastAPI:
     @app.get("/api/state")
     async def get_state(request: Request):
         return await engine(request).state()
+
+    @app.get("/api/clock")
+    async def get_clock(request: Request):
+        return engine(request).clock_view()
+
+    @app.post("/api/clock/advance")
+    async def advance_clock(body: ClockAdvance, request: Request):
+        return await engine(request).advance_clock(body.ms)
 
     @app.post("/api/reset")
     async def reset(request: Request):
